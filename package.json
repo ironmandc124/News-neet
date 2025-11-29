@@ -1,1 +1,8 @@
-
+{
+  "name": "unlimited-news-api",
+  "version": "1.0.0",
+  "dependencies": {
+    "rss-parser": "latest",
+    "node-fetch": "latest"
+  }
+}
