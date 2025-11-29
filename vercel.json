@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "functions": {
+    "api/news.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "builds": [
+    { "src": "api/news.js", "use": "@vercel/node" }
+  ]
+}
