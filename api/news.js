@@ -1,4 +1,4 @@
-// api/news.js - GNews with stronger dedupe (canonical URL + normalized title)
+// api/news.js - GNews with stronger dedupe + state-wise strict filter + strict/loose fallback
 
 // ---------------------- helpers ----------------------
 function normalizeTitle(t) {
@@ -28,18 +28,36 @@ function canonicalizeUrl(u) {
 // ---------------------- filters ----------------------
 function filterNEETPG_Strict(items) {
   const include = [
+    // General NEET PG
     "neet pg","neet-pg","nbems","nbe","fmge","pg medical","pg counselling",
-    "pg entrance","md ms","postgraduate","post graduate","neet ss","dnb"
+    "pg entrance","md ms","postgraduate","post graduate","neet ss","dnb",
+
+    // State-wise NEET PG phrases (lowercase)
+    "gujarat neet pg","maharashtra neet pg","rajasthan neet pg","delhi neet pg",
+    "uttar pradesh neet pg","up neet pg","tamil nadu neet pg","kerala neet pg",
+    "karnataka neet pg","andhra pradesh neet pg","telangana neet pg","madhya pradesh neet pg",
+    "mp neet pg","punjab neet pg","haryana neet pg","jharkhand neet pg",
+    "bihar neet pg","odisha neet pg","odisha neet pg","chhattisgarh neet pg",
+    "uttarakhand neet pg","jammu and kashmir neet pg","jammu kashmir neet pg","himachal neet pg",
+    "assam neet pg","tripura neet pg","manipur neet pg","meghalaya neet pg",
+    "nagaland neet pg","mizoram neet pg","sikkim neet pg","goa neet pg","west bengal neet pg",
+
+    // short forms & variants
+    "gujarat pg", "maharashtra pg", "karnataka pg", "tn neet pg", "tn pg", "tn pg counselling",
+    "gujarat counselling", "gujarat seat allotment", "gujarat merit list", "gujarat admit card",
+    "mcc", "nbems", "nbe", "state neet pg", "state counselling neet pg"
   ];
+
   return (items||[]).filter(a=>{
     const t = ((a.title||"") + " " + (a.description||"") + " " + (a.content||"")).toLowerCase();
-    return include.some(k=>t.includes(k));
+    return include.some(k => t.includes(k));
   });
 }
+
 function filterNEETPG_Loose(items) {
   return (items||[]).filter(a=>{
     const t = ((a.title||"") + " " + (a.description||"") + " " + (a.content||"")).toLowerCase();
-    return (t.includes("neet") || t.includes("counselling") || t.includes("medical") || t.includes("pg"));
+    return (t.includes("neet") || t.includes("counselling") || t.includes("medical") || t.includes("pg") || t.includes("seat allotment") || t.includes("merit list") || t.includes("admit card") || t.includes("counselling result"));
   });
 }
 
@@ -83,7 +101,7 @@ function normalizeAndDedupe(arr) {
       normalizedTitle: normTitle,
       publishedAt: publishedAt,
       image: item.image || item.imageUrl || item.urlToImage || null,
-      source: item.source || item.source?.name || item.source?.title || item.source?.name || null
+      source: (item.source && (item.source.name || item.source.title)) || item.source || null
     };
 
     // 1) prefer one per canonical URL (keep newest)
