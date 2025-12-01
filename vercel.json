@@ -4,8 +4,5 @@
     "api/news.js": {
       "runtime": "nodejs18.x"
     }
-  },
-  "builds": [
-    { "src": "api/news.js", "use": "@vercel/node" }
-  ]
+  }
 }
