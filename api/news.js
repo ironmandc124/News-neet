@@ -1,14 +1,6 @@
-// ================================
-// CLEAN CDATA
-// ================================
-function cleanCDATA(s) {
-  if (!s) return s;
-  return s.replace(/<!\[CDATA\[(.*?)\]\]>/gi, "$1").trim();
-}
-
-// ================================
-// FILTER: ONLY NEET PG / PG MEDICAL
-// ================================
+// ============================
+// FILTER: ONLY NEET PG
+// ============================
 function filterNEETPG(articles) {
   const include = [
     "neet pg",
@@ -18,52 +10,36 @@ function filterNEETPG(articles) {
     "fmge",
     "pg medical",
     "pg counselling",
-    "mcc",
-    "neet ss",
-    "dnb",
-    "md ms",
     "pg entrance",
+    "md ms",
     "postgraduate",
-    "post graduate"
+    "post graduate",
+    "neet ss",
+    "dnb"
   ];
 
   const exclude = [
     "neet ug",
     "neet-ug",
-    "undergraduate",
-    "ssc",
     "school",
     "police",
-    "constable",
+    "ssc",
     "upsc",
-    "engineering",
-    "jkpsc"
+    "constable",
+    "engineering"
   ];
 
-  return (articles || []).filter((a) => {
-    const text =
-      ((a.title || "") + " " + (a.summary || "") + " " + (a.source || "")).toLowerCase();
+  return (articles || []).filter(a => {
+    const t = ((a.title || "") + " " + (a.description || "")).toLowerCase();
 
-    // BLOCK UG + unrelated education
-    if (exclude.some((bad) => text.includes(bad))) return false;
-
-    // MUST contain at least 1 PG term
-    return include.some((good) => text.includes(good));
+    if (exclude.some(bad => t.includes(bad))) return false;
+    return include.some(good => t.includes(good));
   });
 }
 
-// ================================
-// SIMPLE FETCH JSON
-// ================================
-async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) return [];
-  return res.json();
-}
-
-// ================================
-// GNEWS (NEET PG keywords)
-// ================================
+// ============================
+// FETCH GNEWS ONLY
+// ============================
 async function fetchGNews() {
   try {
     const query =
@@ -75,106 +51,34 @@ async function fetchGNews() {
       "&lang=en&country=in&max=50&token=" +
       process.env.GNEWS_API_KEY;
 
-    const data = await fetchJSON(url);
-    return data.articles || [];
-  } catch {
-    return [];
-  }
-}
-
-// ================================
-// REDDIT (medicalschoolindia)
-// ================================
-async function fetchReddit() {
-  try {
-    const url = "https://www.reddit.com/r/medicalschoolindia.json?limit=30";
-    const data = await fetchJSON(url);
-    if (!data.data) return [];
-
-    return data.data.children.map((p) => ({
-      title: p.data.title,
-      summary: p.data.selftext,
-      source: "Reddit",
-      link: "https://reddit.com" + p.data.permalink,
-      image: p.data.thumbnail?.startsWith("http") ? p.data.thumbnail : null,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-// ================================
-// RSS: Times of India (Education)
-// ================================
-async function fetchRSS() {
-  try {
-    const url = "https://timesofindia.indiatimes.com/rssfeeds/913168846.cms";
-
     const res = await fetch(url);
-    const xml = await res.text();
+    if (!res.ok) return [];
+    const data = await res.json();
 
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((m) => {
-      const block = m[1];
-      return {
-        title: cleanCDATA((block.match(/<title>([\s\S]*?)<\/title>/) || [])[1]),
-        summary: cleanCDATA(
-          (block.match(/<description>([\s\S]*?)<\/description>/) || [])[1]
-        ),
-        link: cleanCDATA((block.match(/<link>([\s\S]*?)<\/link>/) || [])[1]),
-        publishedAt: (block.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1],
-        source: "TOI",
-      };
-    });
-
-    return items;
-  } catch {
+    return data.articles || [];
+  } catch (e) {
     return [];
   }
 }
 
-// ================================
-// REMOVE DUPLICATES
-// ================================
-function dedupe(list) {
-  const map = new Map();
-  for (const item of list) {
-    if (!item || !item.link) continue;
-    map.set(item.link, item);
-  }
-  return [...map.values()];
-}
-
-// ================================
-// MAIN HANDLER (Vercel)
-// ================================
+// ============================
+// MAIN HANDLER
+// ============================
 export default async function handler(req, res) {
   try {
-    // fetch all sources in parallel
-    const [gnews, reddit, rss] = await Promise.all([
-      fetchGNews(),
-      fetchReddit(),
-      fetchRSS(),
-    ]);
+    // fetch from GNews only
+    const gnews = await fetchGNews();
 
-    // merge + dedupe
-    let merged = dedupe([
-      ...(gnews || []),
-      ...(reddit || []),
-      ...(rss || []),
-    ]);
+    // filter NEET PG only
+    const filtered = filterNEETPG(gnews);
 
-    // clean CDATA in links
-    merged = merged.map((a) => ({ ...a, link: cleanCDATA(a.link) }));
-
-    // FILTER NEET PG **ONLY**
-    merged = filterNEETPG(merged);
-
-    res.status(200).json({
+    return res.status(200).json({
       fetchedAt: new Date().toISOString(),
-      count: merged.length,
-      articles: merged,
+      count: filtered.length,
+      articles: filtered
     });
+
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
 }
