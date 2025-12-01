@@ -1,5 +1,5 @@
 // ============================
-// FILTER: ONLY NEET PG
+// FILTER: ONLY NEET PG (NO EXCLUDE)
 // ============================
 function filterNEETPG(articles) {
   const include = [
@@ -18,21 +18,8 @@ function filterNEETPG(articles) {
     "dnb"
   ];
 
-  const exclude = [
-    "neet ug",
-    "neet-ug",
-    "school",
-    "police",
-    "ssc",
-    "upsc",
-    "constable",
-    "engineering"
-  ];
-
   return (articles || []).filter(a => {
     const t = ((a.title || "") + " " + (a.description || "")).toLowerCase();
-
-    if (exclude.some(bad => t.includes(bad))) return false;
     return include.some(good => t.includes(good));
   });
 }
