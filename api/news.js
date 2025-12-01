@@ -1,124 +1,248 @@
+// ================================
 // api/news.js
-// GNews primary fetch with automatic fallback + filter + debug info
+// Fetch GNews + RSS (TOI, FreePress, Telegram via RSSHub),
+// filter NEET-PG, remove articles older than 48 hours (all sources).
+// ================================
 
-function filterNEETPG_Strict(items) {
+// -------------------- helpers --------------------
+function cleanCDATA(s) {
+  if (!s) return s;
+  return s.replace(/<!\[CDATA\[(.*?)\]\]>/gi, "$1").trim();
+}
+
+function ensureString(x) {
+  return x == null ? "" : String(x);
+}
+
+function parseDateSafe(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return null;
+  return d;
+}
+
+// -------------------- filter NEET PG (include only) --------------------
+function filterNEETPG(articles) {
   const include = [
-    "neet pg","neet-pg","nbems","nbe","fmge","pg medical","pg counselling",
-    "pg entrance","md ms","postgraduate","post graduate","neet ss","dnb"
+    "neet pg",
+    "neet-pg",
+    "nbems",
+    "nbe",
+    "fmge",
+    "pg medical",
+    "pg counselling",
+    "neet ss",
+    "dnb",
+    "md ms",
+    "pg entrance",
+    "postgraduate",
+    "post graduate",
+    "counselling",
+    "medical college",
+    "seat allotment"
   ];
-  return (items || []).filter(a => {
-    const t = ((a.title||"") + " " + (a.description||"") + " " + (a.content||"")).toLowerCase();
-    return include.some(k => t.includes(k));
+
+  return (articles || []).filter((a) => {
+    const text = (ensureString(a.title) + " " + ensureString(a.summary) + " " + ensureString(a.description || "")).toLowerCase();
+    return include.some((good) => text.includes(good));
   });
 }
 
-function filterNEETPG_Loose(items) {
-  // looser: keep anything that mentions neet or counselling or medical
-  return (items || []).filter(a => {
-    const t = ((a.title||"") + " " + (a.description||"") + " " + (a.content||"")).toLowerCase();
-    return (t.includes("neet") || t.includes("counselling") || t.includes("medical") || t.includes("pg"));
+// -------------------- expiry: drop articles older than 48 hours --------------------
+function dropOlderThan48h(articles) {
+  const TTL = 2 * 24 * 60 * 60 * 1000; // 48 hours in ms
+  const now = Date.now();
+
+  return (articles || []).filter(a => {
+    const date = parseDateSafe(a.publishedAt || a.published || a.pubDate || a.publishedAt);
+    if (!date) return false; // drop if no valid date
+    return now - date.getTime() <= TTL;
   });
 }
 
-async function fetchGNewsRaw(query, max=50) {
-  const key = process.env.GNEWS_API_KEY || "";
-  const url = "https://gnews.io/api/v4/search?q=" + encodeURIComponent(query) + "&lang=en&country=in&max=" + max + "&token=" + encodeURIComponent(key);
+// -------------------- fetch helpers --------------------
+async function fetchJSON(url) {
   try {
-    const res = await fetch(url);
-    const text = await res.text().catch(()=>"");
-    let json = null;
-    try { json = JSON.parse(text); } catch(e) { json = null; }
-    return { ok: res.ok, status: res.status, statusText: res.statusText, url, rawText: text.slice(0, 2000), json };
-  } catch (err) {
-    return { ok:false, status: null, error: String(err) };
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
   }
 }
 
-// remove duplicate by URL, keep newest first if publishedAt present
-function normalizeAndDedupe(arr) {
-  const map = new Map();
-  (arr || []).forEach(a => {
-    const key = (a.url || a.link || a.id || a.title||"").toString();
-    if (!key) return;
-    // keep last occurrence (we will sort after)
-    map.set(key, a);
-  });
-  return Array.from(map.values()).sort((a,b)=>{
-    const da = new Date(a.publishedAt || a.published || a.publishedAt || 0).getTime();
-    const db = new Date(b.publishedAt || b.published || b.publishedAt || 0).getTime();
-    return db - da;
+// GNews
+async function fetchGNews() {
+  try {
+    const query = 'neet pg OR "neet pg 2025" OR "neet pg 2026" OR nbems OR fmge OR "pg medical" OR "pg counselling"';
+    const url =
+      "https://gnews.io/api/v4/search?q=" +
+      encodeURIComponent(query) +
+      "&lang=en&country=in&max=50&token=" +
+      encodeURIComponent(process.env.GNEWS_API_KEY || "");
+    const data = await fetchJSON(url);
+    if (!data || !Array.isArray(data.articles)) return [];
+    // normalize GNews fields to common shape
+    return data.articles.map(a => ({
+      id: a.id || a.url || null,
+      title: a.title || "",
+      summary: a.description || a.content || "",
+      description: a.description || "",
+      content: a.content || "",
+      link: a.url || a.link || "",
+      url: a.url || a.link || "",
+      publishedAt: a.publishedAt || a.published || null,
+      image: a.image || a.urlToImage || null,
+      source: a.source?.name || "GNews"
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// RSS sources (TOI, FreePress, Telegram via RSSHub)
+const RSS_SOURCES = [
+  "https://timesofindia.indiatimes.com/rssfeeds/913168846.cms",
+  "https://www.freepressjournal.in/rss/section/education",
+  "https://rsshub.app/telegram/channel/zynerdneetpg2025"
+];
+
+async function fetchRSSFeed(rssUrl) {
+  try {
+    const r = await fetch(rssUrl);
+    if (!r.ok) return [];
+    const xml = await r.text();
+
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map(m => {
+      const block = m[1];
+      const title = cleanCDATA((block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "");
+      const description = cleanCDATA((block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "");
+      const link = cleanCDATA((block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "");
+      const pub = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || (block.match(/<dc:date>([\s\S]*?)<\/dc:date>/) || [])[1] || null;
+      return {
+        id: link || title,
+        title,
+        summary: description,
+        description,
+        link,
+        url: link,
+        publishedAt: pub,
+        image: null,
+        source: rssUrl.includes("telegram") ? "Telegram Channel" : (rssUrl.includes("freepressjournal") ? "FreePress" : "TOI")
+      };
+    });
+
+    return items;
+  } catch (e) {
+    console.log("fetchRSSFeed error", rssUrl, e && e.message);
+    return [];
+  }
+}
+
+// -------------------- dedupe by canonical url or title --------------------
+function canonicalizeUrl(u) {
+  try {
+    if (!u) return "";
+    const x = new URL(u);
+    x.hash = "";
+    x.search = "";
+    return x.toString().replace(/\/+$/, "");
+  } catch {
+    return (u || "").toString();
+  }
+}
+function normalizeTitle(t) {
+  if (!t) return "";
+  return t.toString().toLowerCase().replace(/[\u2018\u2019\u201C\u201D]/g, "").replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function dedupe(list) {
+  const byUrl = new Map();
+  const byTitle = new Map();
+
+  for (const it of (list || [])) {
+    const url = canonicalizeUrl(it.link || it.url || "");
+    const normTitle = normalizeTitle(it.title || "");
+
+    const obj = {
+      ...it,
+      link: it.link || it.url || "",
+      publishedAt: it.publishedAt || it.published || it.pubDate || null
+    };
+
+    if (url) {
+      if (!byUrl.has(url)) byUrl.set(url, obj);
+      else {
+        // keep newest
+        const ex = byUrl.get(url);
+        const exT = parseDateSafe(ex.publishedAt)?.getTime() || 0;
+        const nT = parseDateSafe(obj.publishedAt)?.getTime() || 0;
+        if (nT > exT) byUrl.set(url, obj);
+      }
+    } else if (normTitle) {
+      if (!byTitle.has(normTitle)) byTitle.set(normTitle, obj);
+      else {
+        const ex = byTitle.get(normTitle);
+        const exT = parseDateSafe(ex.publishedAt)?.getTime() || 0;
+        const nT = parseDateSafe(obj.publishedAt)?.getTime() || 0;
+        if (nT > exT) byTitle.set(normTitle, obj);
+      }
+    }
+  }
+
+  // merge: prefer canonical url entries, then title-only entries
+  const merged = new Map();
+  for (const [u, item] of byUrl) {
+    const key = normalizeTitle(item.title) || u;
+    merged.set(key, item);
+  }
+  for (const [t, item] of byTitle) {
+    const key = t || item.link || Date.now() + Math.random();
+    if (!merged.has(key)) merged.set(key, item);
+  }
+
+  // return as array sorted by publishedAt desc
+  return Array.from(merged.values()).sort((a, b) => {
+    const ta = parseDateSafe(a.publishedAt)?.getTime() || 0;
+    const tb = parseDateSafe(b.publishedAt)?.getTime() || 0;
+    return tb - ta;
   });
 }
 
+// -------------------- main handler --------------------
 export default async function handler(req, res) {
   try {
-    // Queries
-    const strictQ = 'neet pg OR "neet pg 2025" OR "neet pg 2026" OR nbems OR fmge OR "pg medical" OR "pg counselling"';
-    const broaderQ = 'neet OR "pg counselling" OR "medical counselling" OR "neet pg" OR "neet- pg" OR "neet-pg"';
+    // fetch gnews
+    const gnews = await fetchGNews();
 
-    // 1) Try strict query
-    const r1 = await fetchGNewsRaw(strictQ, 50);
+    // fetch all RSS feeds in parallel
+    const rssArrays = await Promise.all(RSS_SOURCES.map(u => fetchRSSFeed(u)));
+    const rssItems = rssArrays.flat();
 
-    // If r1.ok and json present, extract articles
-    let articles = [];
-    if (r1.ok && r1.json && Array.isArray(r1.json.articles)) {
-      articles = r1.json.articles;
-    }
+    // merge + dedupe
+    const mergedRaw = [...(gnews || []), ...(rssItems || [])];
+    const merged = dedupe(mergedRaw);
 
-    // 2) If no articles from strict, try broader query
-    let usedQuery = strictQ;
-    let fallbackInfo = null;
-    if ((!articles || articles.length === 0) || !r1.ok) {
-      const r2 = await fetchGNewsRaw(broaderQ, 50);
-      fallbackInfo = r2;
-      if (r2.ok && r2.json && Array.isArray(r2.json.articles)) {
-        articles = r2.json.articles;
-        usedQuery = broaderQ;
-      }
-    }
+    // filter NEET PG only
+    let filtered = filterNEETPG(merged);
 
-    // normalize/dedupe
-    articles = normalizeAndDedupe(articles);
+    // drop articles older than 48 hours (applies to ALL sources)
+    filtered = dropOlderThan48h(filtered);
 
-    // 3) Apply strict filter first
-    let filtered = filterNEETPG_Strict(articles || []);
-
-    // 4) If strict filtered list empty but raw articles exist, apply loose filter
-    let usedFilter = "strict";
-    if ((!filtered || filtered.length === 0) && (articles && articles.length > 0)) {
-      filtered = filterNEETPG_Loose(articles);
-      usedFilter = "loose";
-    }
-
-    // Prepare response with debug info so you can see why results are empty
-    const debug = {
-      fetchedAt: new Date().toISOString(),
-      usedEnvironmentKeyPresent: !!process.env.GNEWS_API_KEY,
-      initialStrictFetch: {
-        ok: r1.ok,
-        status: r1.status,
-        statusText: r1.statusText,
-        sample: (r1.json && r1.json.articles) ? r1.json.articles.slice(0,5).map(a=>({title:a.title, url:a.url})) : []
-      },
-      fallbackFetch: fallbackInfo ? {
-        ok: fallbackInfo.ok,
-        status: fallbackInfo.status,
-        statusText: fallbackInfo.statusText,
-        sample: (fallbackInfo.json && fallbackInfo.json.articles) ? fallbackInfo.json.articles.slice(0,5).map(a=>({title:a.title,url:a.url})) : []
-      } : null,
-      usedQuery,
-      usedFilter,
-      rawCount: (articles||[]).length,
-      finalCount: (filtered||[]).length
-    };
+    // final sort
+    filtered.sort((a, b) => {
+      const ta = parseDateSafe(a.publishedAt)?.getTime() || 0;
+      const tb = parseDateSafe(b.publishedAt)?.getTime() || 0;
+      return tb - ta;
+    });
 
     return res.status(200).json({
       fetchedAt: new Date().toISOString(),
       count: filtered.length,
-      articles: filtered,
-      debug
+      articles: filtered
     });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    console.error("news handler error:", e && e.message);
+    return res.status(500).json({ error: String(e) });
   }
 }
