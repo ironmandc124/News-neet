@@ -1,66 +1,180 @@
-// DEBUG news endpoint - shows request URLs, status, small body preview, parsed counts
-export default async function handler(req, res) {
-  const debug = { time: new Date().toISOString() };
+// api/news.js
+// Aggregate NEET-PG news from multiple RSS sources + Telegram (RSSHub).
+// No GNews used (avoids daily quota issues).
+// Filters NEET-PG keywords, splits telegramNews, expires items after 48h.
 
-  // --- GNews request ---
-  const gnewsKey = process.env.GNEWS_API_KEY || "";
-  debug.gnews_key_present = !!gnewsKey;
-  const gnewsQuery = 'neet pg OR "neet pg 2025" OR nbems OR fmge OR "pg counselling"';
-  const gnewsUrl = "https://gnews.io/api/v4/search?q=" + encodeURIComponent(gnewsQuery) + "&lang=en&country=in&max=50&token=" + encodeURIComponent(gnewsKey);
-  debug.gnews_request = gnewsUrl;
+// ---------- helpers ----------
+function cleanCDATA(s) {
+  if (!s) return "";
+  return s.replace(/<!\[CDATA\[(.*?)\]\]>/gi, "$1").trim();
+}
+function ensureString(x) { return x == null ? "" : String(x); }
+function parseDateSafe(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+function within48Hours(dateStr) {
+  const d = parseDateSafe(dateStr);
+  if (!d) return false;
+  return (Date.now() - d.getTime()) <= 48 * 60 * 60 * 1000;
+}
 
+// ---------- filter: NEET PG keywords ----------
+function filterNEETPG(items) {
+  const inc = [
+    "neet pg", "neet-pg", "nbems", "nbe", "fmge", "pg medical",
+    "pg counselling", "neet ss", "dnb", "md ms", "pg entrance",
+    "postgraduate", "post graduate", "counselling", "medical college",
+    "seat allotment", "counselling result", "seat allotment result"
+  ];
+  return (items || []).filter(a => {
+    const t = (ensureString(a.title) + " " + ensureString(a.summary) + " " + ensureString(a.description)).toLowerCase();
+    return inc.some(k => t.includes(k));
+  });
+}
+
+// ---------- dedupe by link or title ----------
+function canonicalizeUrl(u) {
   try {
-    const gRes = await fetch(gnewsUrl);
-    debug.gnews_status = gRes.status + " " + (gRes.statusText || "");
-    const gText = await gRes.text().catch(()=>"(no body)");
-    debug.gnews_preview = gText.slice(0, 1500);
-    try { debug.gnews_json = JSON.parse(gText); } catch(e){ debug.gnews_json = null; debug.gnews_json_parse_error = String(e); }
-  } catch (e) {
-    debug.gnews_error = String(e);
+    if (!u) return "";
+    const x = new URL(u);
+    x.hash = "";
+    x.search = "";
+    return x.toString().replace(/\/+$/, "");
+  } catch {
+    return (u || "").toString();
   }
+}
+function normalizeTitle(t) {
+  if (!t) return "";
+  return t.toString().toLowerCase().replace(/\s+/g, " ").trim();
+}
+function dedupe(list) {
+  const byUrl = new Map();
+  const byTitle = new Map();
 
-  // --- Telegram RSS request ---
-  const tgUrl = "https://rsshub.app/telegram/channel/zynerdneetpg2025";
-  debug.telegram_request = tgUrl;
-  try {
-    const tRes = await fetch(tgUrl);
-    debug.telegram_status = tRes.status + " " + (tRes.statusText || "");
-    const tText = await tRes.text().catch(()=>"(no body)");
-    debug.telegram_preview = tText.slice(0, 1500);
-    // quick parse count of <item>
-    const items = [...tText.matchAll(/<item>([\s\S]*?)<\/item>/g)];
-    debug.telegram_item_count = items.length;
-    // sample first item raw
-    debug.telegram_first_item_raw = items[0] ? items[0][1].slice(0,1000) : null;
-  } catch (e) {
-    debug.telegram_error = String(e);
-  }
+  for (const it of (list || [])) {
+    const url = canonicalizeUrl(it.link || it.url || "");
+    const title = normalizeTitle(it.title || "");
+    const obj = { ...it, link: it.link || it.url || "" };
 
-  // --- Post-processing simulation (what your real code would do) ---
-  // parse gnews json articles count if available
-  try {
-    if (debug.gnews_json && Array.isArray(debug.gnews_json.articles)) {
-      debug.gnews_articles_count = debug.gnews_json.articles.length;
-      // sample first article keys
-      debug.gnews_sample = debug.gnews_json.articles.slice(0,5).map(a => ({ title: a.title, url: a.url, publishedAt: a.publishedAt }));
-    } else {
-      debug.gnews_articles_count = 0;
+    if (url) {
+      if (!byUrl.has(url)) byUrl.set(url, obj);
+    } else if (title) {
+      if (!byTitle.has(title)) byTitle.set(title, obj);
     }
-  } catch (e) {
-    debug.gnews_parse_error = String(e);
   }
 
-  // --- quick timezone / date check for expiry logic ---
-  debug.now = new Date().toISOString();
-  // find latest publishedAt in gnews sample if any
-  try {
-    const arr = debug.gnews_json && Array.isArray(debug.gnews_json.articles) ? debug.gnews_json.articles : [];
-    if (arr.length) {
-      const latest = arr.map(a => a.publishedAt).filter(Boolean).sort().reverse()[0];
-      debug.gnews_latest_publishedAt = latest || null;
-    } else debug.gnews_latest_publishedAt = null;
-  } catch(e){ debug.gnews_latest_publishedAt_error = String(e); }
+  const out = [...byUrl.values()];
+  for (const v of byTitle.values()) {
+    if (!out.find(x => normalizeTitle(x.title) === normalizeTitle(v.title))) out.push(v);
+  }
+  return out;
+}
 
-  // --- return full debug object ---
-  return res.status(200).json({ debug });
+// ---------- RSS sources (add/remove as you want) ----------
+const RSS_SOURCES = [
+  // Economic Times - Education top stories (good source for counselling/results)
+  "https://education.economictimes.indiatimes.com/rss/topstories",
+
+  // India Today - Education section (broad)
+  "https://www.indiatoday.in/education-today/rss",
+
+  // Medical Dialogues (medical education & news)
+  "https://speciality.medicaldialogues.in/rss-feed",
+
+  // FreePressJournal education (kept)
+  "https://www.freepressjournal.in/rss/section/education",
+
+  // Telegram via RSSHub (Zynerd channel)
+  "https://rsshub.app/telegram/channel/zynerdneetpg2025"
+];
+
+// ---------- fetch & parse RSS (safe) ----------
+async function fetchRSSFeed(url) {
+  try {
+    const r = await fetch(url, { method: "GET" });
+    if (!r.ok) {
+      // return empty + include simple debug hint
+      return { items: [], url, status: r.status };
+    }
+    const xml = await r.text();
+
+    // parse <item> blocks
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map(m => {
+      const block = m[1];
+      const title = cleanCDATA((block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "");
+      const description = cleanCDATA((block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "");
+      const link = cleanCDATA((block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "");
+      const pub = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || (block.match(/<dc:date>([\s\S]*?)<\/dc:date>/) || [])[1] || null;
+
+      return {
+        title,
+        summary: description,
+        description,
+        link,
+        publishedAt: pub,
+        source: url.includes("telegram") ? "Telegram" :
+                url.includes("economictimes") ? "EconomicTimes" :
+                url.includes("indiatoday") ? "IndiaToday" :
+                url.includes("medicaldialogues") ? "MedicalDialogues" :
+                url.includes("freepressjournal") ? "FreePress" : url
+      };
+    });
+
+    return { items, url, status: 200 };
+  } catch (e) {
+    return { items: [], url, status: "err", error: String(e) };
+  }
+}
+
+// ---------- main handler ----------
+export default async function handler(req, res) {
+  try {
+    // fetch RSS feeds in parallel
+    const rssResults = await Promise.all(RSS_SOURCES.map(u => fetchRSSFeed(u)));
+
+    // collect all parsed items, but keep telegram separate
+    let allItems = [];
+    let telegramItems = [];
+
+    for (const r of rssResults) {
+      if (!r || !Array.isArray(r.items)) continue;
+      if ((r.url || "").includes("/telegram/") || (r.items.length && r.items[0]?.source === "Telegram")) {
+        telegramItems.push(...r.items);
+      } else {
+        allItems.push(...r.items);
+      }
+    }
+
+    // filter for NEET-PG keywords
+    allItems = filterNEETPG(allItems);
+    telegramItems = filterNEETPG(telegramItems);
+
+    // drop items older than 48h
+    allItems = allItems.filter(a => within48Hours(a.publishedAt));
+    telegramItems = telegramItems.filter(a => within48Hours(a.publishedAt));
+
+    // dedupe each list and sort by publishedAt desc
+    allItems = dedupe(allItems).sort((a,b) => (parseDateSafe(b.publishedAt)?.getTime() || 0) - (parseDateSafe(a.publishedAt)?.getTime() || 0));
+    telegramItems = dedupe(telegramItems).sort((a,b) => (parseDateSafe(b.publishedAt)?.getTime() || 0) - (parseDateSafe(a.publishedAt)?.getTime() || 0));
+
+    // debug info (helpful while you verify)
+    const debug = {
+      fetchedAt: new Date().toISOString(),
+      sourcesQueried: rssResults.map(r => ({ url: r.url, status: r.status || "unknown", parsed: (r.items||[]).length }))
+    };
+
+    return res.status(200).json({
+      debug,
+      fetchedAt: new Date().toISOString(),
+      countGeneral: allItems.length,
+      countTelegram: telegramItems.length,
+      generalNews: allItems,
+      telegramNews: telegramItems
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
 }
