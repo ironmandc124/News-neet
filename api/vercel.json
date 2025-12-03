@@ -1,7 +1,0 @@
-cat > vercel.json <<'JSON'
-{
-  "crons": [
-    { "path": "/api/cron", "schedule": "*/30 * * * *" }
-  ]
-}
-JSON
