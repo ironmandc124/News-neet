@@ -1,16 +1,6 @@
 /*
- Lightweight wrapper for cron implementation.
- Keeps the top-level function minimal so Vercel registers it reliably.
- The full implementation lives in `cron.impl.js`.
-*/
-import handler from './cron.impl.js';
-
-export default handler;
-/*
- api/cron.js
- Fetch NEET-PG news from GNews (strict -> fallback) or RSS sources.
- Apply deduplication and save to news-cache.json.
- Called by Vercel Cron every 30 minutes.
+ api/cron.impl.js
+ Full implementation moved from cron.js. This file contains the heavy imports and logic.
 */
 import { promises as fs } from "fs";
 import path from "path";
